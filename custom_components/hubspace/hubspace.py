@@ -9,11 +9,11 @@ import base64
 import os
 import logging
 
-from homeassistant.const import STATE_ON
 from homeassistant.helpers.entity import Entity
 from .const import (
     FUNCTION_CLASS,
     FUNCTION_INSTANCE,
+    SETTABLE_FUNCTION_CLASSES,
     FunctionClass,
     FunctionInstance,
     FunctionKey,
@@ -182,9 +182,13 @@ class HubspaceFunctionKeyedObject(HubspaceObject):
     """A Hubspace object which has a function class."""
 
     @property
-    def function_class(self) -> FunctionClass or None:
+    def function_class(self) -> FunctionClass:
         """Identifier for this objects's function class."""
-        return self._data[FUNCTION_CLASS] if FUNCTION_CLASS in self._data else None
+        return (
+            self._data[FUNCTION_CLASS]
+            if FUNCTION_CLASS in self._data
+            else FunctionClass.UNSUPPORTED
+        )
 
     @property
     def function_instance(self) -> str or None:
@@ -192,11 +196,6 @@ class HubspaceFunctionKeyedObject(HubspaceObject):
         return (
             self._data[FUNCTION_INSTANCE] if FUNCTION_INSTANCE in self._data else None
         )
-
-    @property
-    def function_key(self) -> FunctionKey:
-        """Identifier for this objects's function."""
-        return (self.function_class, self.function_instance)
 
 
 class HubspaceFunction(HubspaceFunctionKeyedObject, HubspaceIdentifiableObject):
@@ -212,20 +211,33 @@ class HubspaceFunction(HubspaceFunctionKeyedObject, HubspaceIdentifiableObject):
     def values(self) -> list[Any]:
         if not self._values:
             self._values = [value.get("name") for value in self._data.get("values", [])]
+            self._values.sort(key=self._value_key)
         return self._values
+
+    def _value_key(self, value: Any) -> Any:
+        return value
 
 
 class HubspaceStateValue(HubspaceFunctionKeyedObject):
     """A Hubspace object which defines a particular state value."""
 
-    @property
-    def value(self) -> Any or None:
-        json_value = self._data.get("value")
+    def hass_value(self) -> Any or None:
+        hubspace_value = self.hubspace_value()
         if self.function_class == FunctionClass.AVAILABLE:
-            return bool(json_value)
-        if self.function_class == FunctionClass.POWER:
-            return json_value == STATE_ON
+            return bool(hubspace_value)
+        return hubspace_value
+
+    def set_hass_value(self, value):
+        if self.function_class == FunctionClass.AVAILABLE:
+            self.set_hubspace_value(str(value))
+        else:
+            self.set_hubspace_value(value)
+
+    def hubspace_value(self) -> Any or None:
         return self._data.get("value")
+
+    def set_hubspace_value(self, value):
+        self._data["value"] = value
 
     @property
     def last_update_time(self) -> int or None:
@@ -237,8 +249,12 @@ class HubspaceEntity(HubspaceIdentifiableObject, Entity):
 
     _function_class: HubspaceFunction = HubspaceFunction
     _state_value_class: HubspaceStateValue = HubspaceStateValue
-    _functions: dict[FunctionKey, HubspaceFunction] or None = None
-    _states: dict[FunctionKey, _state_value_class] or None = None
+    _functions: dict[
+        FunctionClass, dict[FunctionInstance or None, HubspaceFunction]
+    ] or None = None
+    _states: dict[
+        FunctionClass, dict[FunctionInstance or None, _state_value_class]
+    ] or None = None
     _skip_next_update = False
 
     def __init__(
@@ -269,17 +285,25 @@ class HubspaceEntity(HubspaceIdentifiableObject, Entity):
         return self._get_state_value(FunctionClass.AVAILABLE, default=True)
 
     @property
-    def functions(self) -> dict[FunctionKey, HubspaceFunction] or None:
+    def functions(
+        self,
+    ) -> dict[FunctionClass, dict[FunctionInstance or None, HubspaceFunction]] or None:
         """Return the functions available for this device."""
         if not self._functions:
             self._functions = {}
             for function in self._data.get("description", {}).get("functions", []):
                 hubspace_function = self._function_class(function)
-                self._functions[hubspace_function.function_key] = hubspace_function
+                if hubspace_function.function_class not in self._functions:
+                    self._functions[hubspace_function.function_class] = {}
+                self._functions[hubspace_function.function_class][
+                    hubspace_function.function_instance
+                ] = hubspace_function
         return self._functions
 
     @property
-    def states(self) -> dict[(str or None, str or None), HubspaceStateValue]:
+    def states(
+        self,
+    ) -> dict[FunctionClass, dict[FunctionInstance or None, HubspaceStateValue]]:
         """Return the current states of this device."""
         if not self._states:
             self._set_state(self._data.get("state"))
@@ -330,38 +354,108 @@ class HubspaceEntity(HubspaceIdentifiableObject, Entity):
         self._set_state(state_response.json())
         self._skip_next_update = True
 
+    def _push_state(self):
+        """Pushes the devices current state."""
+        auth_token = get_auth_token(self._refresh_token)
+        date = datetime.datetime.utcnow()
+        utc_time = calendar.timegm(date.utctimetuple()) * 1000
+        states = [state for states in self.states.values() for state in states.values()]
+        state_payload = {
+            "metadeviceId": self.id,
+            "values": [
+                {
+                    "functionClass": state.function_class,
+                    "value": state.hubspace_value(),
+                    "lastUpdateTime": utc_time,
+                }
+                | (
+                    {"functionInstance": state.function_instance}
+                    if state.function_instance
+                    else {}
+                )
+                for state in states
+                if state.hubspace_value() is not None
+                and state.function_class in SETTABLE_FUNCTION_CLASSES
+            ],
+        }
+        state_url = (
+            f"{AFERO_API}/accounts/{self._account_id}/metadevices/{self.id}/state"
+        )
+        state_header = {
+            "user-agent": USER_AGENT,
+            "host": AFERO_SEMANTICS_HOST,
+            "accept-encoding": "gzip",
+            "authorization": f"Bearer {auth_token}",
+            "content-type": "application/json; charset=utf-8",
+        }
+        state_response = requests.put(
+            state_url, json=state_payload, headers=state_header
+        )
+        state_response.close()
+        print(state_payload, "\n\n")
+        print(state_response.json())
+        self._set_state(state_response.json())
+        self._skip_next_update = True
+
+    def _set_state_value(self, key: FunctionKey, value: Any) -> None:
+        states = []
+        if isinstance(key, tuple):
+            state = self.states.get(key[0], {}).get(key[1])
+            if state:
+                states.append(state)
+        else:
+            states.extend(self.states.get(key, {}).values())
+        for state in states:
+            state.set_hass_value(value)
+
     def _set_state(self, state: dict[str, Any] or None) -> None:
         if state:
             self._states = {}
             for value in state.get("values", []):
                 hubspace_state_value = self._state_value_class(value)
-                if (
-                    hubspace_state_value.function_class != FunctionClass.UNSUPPORTED
-                    and hubspace_state_value.function_instance
-                    != FunctionInstance.UNSUPPORTED
-                ):
-                    self._states[
-                        hubspace_state_value.function_key
+                if hubspace_state_value.function_class != FunctionClass.UNSUPPORTED:
+                    if hubspace_state_value.function_class not in self._states:
+                        self._states[hubspace_state_value.function_class] = {}
+                    self._states[hubspace_state_value.function_class][
+                        hubspace_state_value.function_instance
                     ] = hubspace_state_value
 
-    def _get_state_value(
-        self,
-        function_class: FunctionClass,
-        function_instance: FunctionInstance = None,
-        default: Any = None,
-    ) -> Any:
-        state_value = self.states.get((function_class, function_instance))
+    def _get_state_value(self, key: FunctionKey, default: Any = None) -> Any:
+        [function_class, function_instance] = (
+            key if isinstance(key, tuple) else (key, None)
+        )
+        state_value = None
+        if isinstance(key, tuple):
+            state_value = self.states.get(function_class, {}).get(function_instance)
+        else:
+            state_values = list(self.states.get(function_class, {}).values())
+            if len(state_values) > 0:
+                state_value = state_values[0]
+                if len(state_values) > 1:
+                    _LOGGER.warning(
+                        "Only expected at most one function of this FunctionClass.%s. Attempting to use first",
+                        function_class,
+                    )
         if state_value:
-            return state_value.value
+            return state_value.hass_value()
         return default
 
-    def _get_function_values(
-        self,
-        function_class: FunctionClass,
-        function_instance: FunctionInstance = None,
-        default: Any = None,
-    ) -> Any:
-        function = self.functions.get((function_class, function_instance))
+    def _get_function_values(self, key: FunctionKey, default: Any = None) -> Any:
+        [function_class, function_instance] = (
+            key if isinstance(key, tuple) else (key, None)
+        )
+        function = None
+        if isinstance(key, tuple):
+            function = self.functions.get(function_class, {}).get(function_instance)
+        else:
+            functions = list(self.functions.get(function_class, {}).values())
+            if len(functions) > 0:
+                function = functions[0]
+                if len(functions) > 1:
+                    _LOGGER.warning(
+                        "Only expected at most one function of this FunctionClass.%s. Attempting to use first",
+                        function_class,
+                    )
         if function:
             return function.values
         return default

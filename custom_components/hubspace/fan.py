@@ -1,13 +1,11 @@
 """Platform for fan integration."""
-from functools import cache
-import string
 from typing import Any
 
 from homeassistant.util.percentage import (
     ordered_list_item_to_percentage,
     percentage_to_ordered_list_item,
 )
-from .const import FunctionClass, FunctionInstance
+from .const import TOGGLE_DISABLED, TOGGLE_ENABLED, FunctionClass
 from homeassistant.const import STATE_OFF, STATE_ON
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
@@ -42,15 +40,8 @@ def setup_platform(
 
 
 class HubspaceFanFunction(hubspace.HubspaceFunction):
-    @property
-    def values(self) -> list[Any]:
-        if not self._values:
-            self._values = [value["name"] for value in self._data["values"]]
-            self._values.sort(key=self._value_key)
-        return self._values
-
     def _value_key(self, value: Any) -> Any:
-        if self.function_key == (FunctionClass.FAN_SPEED, FunctionInstance.FAN_SPEED):
+        if self.function_class == FunctionClass.FAN_SPEED:
             # Sorts fan speeds which have a format "fan-speed-025"
             return int(value[-3:])
         return value
@@ -66,7 +57,7 @@ class HubspaceFanEntity(FanEntity, hubspace.HubspaceEntity):
     def supported_features(self) -> int:
         """Flag supported features."""
         supported_features = 0
-        if (FunctionClass.FAN_SPEED, FunctionInstance.FAN_SPEED) in self.functions:
+        if FunctionClass.FAN_SPEED in self.functions:
             supported_features |= SUPPORT_SET_SPEED
         if self.preset_modes:
             supported_features |= SUPPORT_PRESET_MODE
@@ -75,13 +66,11 @@ class HubspaceFanEntity(FanEntity, hubspace.HubspaceEntity):
     @property
     def is_on(self) -> bool or None:
         """Return whether the fan is on."""
-        return self._get_state_value(FunctionClass.POWER, FunctionInstance.FAN_POWER)
+        return self._get_state_value(FunctionClass.POWER, STATE_OFF) == STATE_ON
 
     @property
     def _fan_speed_values(self) -> list[str] or None:
-        fan_speed_values = self._get_function_values(
-            FunctionClass.FAN_SPEED, FunctionInstance.FAN_SPEED
-        )
+        fan_speed_values = self._get_function_values(FunctionClass.FAN_SPEED)
         if fan_speed_values:
             # Remove off state from list of values.
             return fan_speed_values[1:]
@@ -93,9 +82,7 @@ class HubspaceFanEntity(FanEntity, hubspace.HubspaceEntity):
         return (
             ordered_list_item_to_percentage(
                 self._fan_speed_values,
-                self._get_state_value(
-                    FunctionClass.FAN_SPEED, FunctionInstance.FAN_SPEED
-                ),
+                self._get_state_value(FunctionClass.FAN_SPEED),
             )
             if self._fan_speed_values
             else None
@@ -116,13 +103,14 @@ class HubspaceFanEntity(FanEntity, hubspace.HubspaceEntity):
 
         Requires SUPPORT_SET_SPEED.
         """
-        for [[function_class, function_instance], state] in self.states.items():
-            if (
-                function_class == FunctionClass.TOGGLE
-                and function_instance is not None
-                and state.value == "enabled"
-            ):
-                return function_instance
+        for [function_class, function] in self.states.items():
+            for [function_instance, state] in function.items():
+                if (
+                    function_class == FunctionClass.TOGGLE
+                    and function_instance is not None
+                    and state.hubspace_value() == "enabled"
+                ):
+                    return function_instance
         return "auto"
 
     @property
@@ -132,9 +120,14 @@ class HubspaceFanEntity(FanEntity, hubspace.HubspaceEntity):
         Requires SUPPORT_SET_SPEED.
         """
         preset_modes = []
-        for [function_class, function_instance] in self.functions:
-            if function_class == FunctionClass.TOGGLE and function_instance is not None:
-                preset_modes.append(function_instance)
+        for function in self.functions.values():
+            preset_modes.extend(
+                [
+                    function_instance
+                    for function_instance in function.keys()
+                    if function_instance is not None
+                ]
+            )
         if preset_modes:
             preset_modes.insert(0, "auto")
         return preset_modes
@@ -146,78 +139,33 @@ class HubspaceFanEntity(FanEntity, hubspace.HubspaceEntity):
         **kwargs,
     ) -> None:
         """Instruct the light to turn on."""
-        state = [
-            {
-                "functionClass": FunctionClass.POWER,
-                "functionInstance": FunctionInstance.FAN_POWER,
-                "value": STATE_ON,
-            },
-        ]
+        self._set_state_value(FunctionClass.POWER, STATE_ON)
         if percentage is not None:
-            state.append(
-                {
-                    "functionClass": FunctionClass.FAN_SPEED,
-                    "functionInstance": FunctionInstance.FAN_SPEED,
-                    "value": percentage_to_ordered_list_item(
-                        self._fan_speed_values, percentage
-                    ),
-                }
+            self._set_state_value(
+                FunctionClass.FAN_SPEED,
+                percentage_to_ordered_list_item(self._fan_speed_values, percentage),
             )
         if preset_mode is not None:
-            state.append(
-                {
-                    "functionClass": FunctionClass.TOGGLE,
-                    "functionInstance": preset_mode,
-                    "value": "enabled",
-                }
-            )
-        self.set_state(state)
+            self._set_state_value((FunctionClass.TOGGLE, preset_mode), TOGGLE_ENABLED)
+        self._push_state()
 
     def set_percentage(self, percentage: int) -> None:
         """Set the speed of the fan, as a percentage."""
-        self.set_state(
-            [
-                {
-                    "functionClass": FunctionClass.FAN_SPEED,
-                    "functionInstance": FunctionInstance.FAN_SPEED,
-                    "value": percentage_to_ordered_list_item(
-                        self._fan_speed_values, percentage
-                    ),
-                },
-            ]
+        self._set_state_value(
+            FunctionClass.FAN_SPEED,
+            percentage_to_ordered_list_item(self._fan_speed_values, percentage),
         )
+        self._push_state()
 
     def set_preset_mode(self, preset_mode: str) -> None:
         if preset_mode == "auto":
-            self.set_state(
-                [
-                    {
-                        "functionClass": FunctionClass.TOGGLE,
-                        "functionInstance": mode,
-                        "value": "disabled",
-                    }
-                    for mode in self.preset_modes
-                ]
-            )
+            for mode in self.preset_modes:
+                self._set_state_value((FunctionClass.TOGGLE, mode), TOGGLE_DISABLED)
         else:
-            self.set_state(
-                [
-                    {
-                        "functionClass": FunctionClass.TOGGLE,
-                        "functionInstance": preset_mode,
-                        "value": "enabled",
-                    },
-                ]
-            )
+            self._set_state_value((FunctionClass.TOGGLE, preset_mode), TOGGLE_ENABLED)
+        self._push_state()
 
     def turn_off(self, **kwargs: Any) -> None:
         """Instruct the light to turn off."""
-        self.set_state(
-            [
-                {
-                    "functionClass": FunctionClass.POWER,
-                    "functionInstance": FunctionInstance.FAN_POWER,
-                    "value": STATE_OFF,
-                },
-            ]
-        )
+        self._set_state_value(FunctionClass.POWER, STATE_OFF)
+        self._push_state()
